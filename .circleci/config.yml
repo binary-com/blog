@@ -1,0 +1,198 @@
+version: 2.1
+orbs:
+  k8s: circleci/kubernetes@0.7.0
+  slack: circleci/slack@3.4.2
+commands:
+  git_checkout_from_cache:
+    description: "Git checkout and save cache"
+    steps:
+      - restore_cache:
+          name: Git restore cache
+          keys:
+            - source-v2-{{ .Branch }}-{{ .Revision }}
+            - source-v2-{{ .Branch }}-
+            - source-v2-
+      - run:
+          name: Fetch git tags
+          command: |
+            mkdir -p ~/.ssh
+            echo 'github.com ssh-rsa AAAAB3NzaC1yc2EAAAABIwAAAQEAq2A7hRGmdnm9tUDbO9IDSwBK6TbQa+PXYPCPy6rbTrTtw7PHkccKrpp0yVhp5HdEIcKr6pLlVDBfOLX9QUsyCOV0wzfjIJNlGEYsdlLJizHhbn2mUjvSAHQqZETYP81eFzLQNnPHt4EVVUh7VfDESU84KezmD5QlWpXLmvU31/yMf+Se8xhHTvKSCZIFImWwoG6mbUoWf9nzpIoaSjB+weqqUUmpaaasXVal72J+UX2B+2RPW3RcT0eOzQgqlJL3RKrTJvdsjE3JEAvGq3lGHSZXy28G3skua2SmVi/w4yCE6gbODqnTWlg7+wC604ydGXA8VJiS5ap43JXiUFFAaQ==' >> ~/.ssh/known_hosts
+            # Fetch tags if git cache is present
+            if [ -e /home/circleci/project/.git ]
+            then
+              git fetch origin --tags
+            fi
+      - checkout
+      - run:
+          name: Compress git objects
+          command: git gc
+      - save_cache:
+          name: Git save cache
+          key: source-v2-{{ .Branch }}-{{ .Revision }}
+          paths:
+            - ".git"
+  bundle_install:
+    description: "Bundle install"
+    steps:
+      - restore_cache:
+          name: Bundle modules cache restore
+          keys:
+            - bundle-v1-{{ checksum "Gemfile" }}
+            - bundle-v1-
+      - run:
+          name: Bundle install
+          command: |
+            bundle install --path ./modules
+      - save_cache:
+          name: Bundle modules cache save
+          key: bundle-v1-{{ checksum "Gemfile" }}
+          paths:
+            - "modules"
+  build:
+    description: "Build Jekyll site"
+    steps:
+      - restore_cache:
+          name: "Build cache restore"
+          keys:
+            - _site-v1-{{ .Revision }}
+            - _site-v1-
+      - run:
+          name: Building Jekyll site
+          command: bundle exec jekyll build --incremental
+      - save_cache:
+          name: Build cache save
+          key: _site-v1-{{ .Revision }}
+          paths:
+            - _site
+  deploy:
+    description: "Deploy to static branches"
+    parameters:
+      target_branch:
+        type: string
+    steps:
+      - checkout
+      - attach_workspace:
+          at: _site
+      - run:
+          name: Tag build
+          command: echo "<< parameters.target_branch >> $(date -u +'%Y-%m-%dT%H:%M:%SZ')" > _site/version
+      - run:
+          name: Install and configure dependencies
+          command: |
+            curl -sL https://deb.nodesource.com/setup_12.x | sudo -E bash -
+            sudo apt install nodejs
+            mkdir "/home/circleci/.npm-packages"
+            npm config set prefix "/home/circleci/.npm-packages"
+            npm install -g gh-pages@2.0.1
+            git config user.email "ci-build@binary.com"
+            git config user.name "ci-build"
+      - add_ssh_keys:
+          fingerprints:
+            - "01:67:4a:6d:26:9c:70:c4:1a:60:91:88:d9:dd:f0:83"
+      - run:
+          name: Deploy docs to gh-pages branch
+          command: /home/circleci/.npm-packages/bin/gh-pages -d _site --branch << parameters.target_branch >> --message '[skip ci]'
+  docker_build_push:
+    description: "Build Docker image"
+    steps:
+      - setup_remote_docker
+      - run:
+          name: Building docker image
+          command: |
+            docker build -t ${DOCKHUB_ORGANISATION}/binary-static-academy:${CIRCLE_SHA1} -t ${DOCKHUB_ORGANISATION}/binary-static-academy:latest .
+      - run:
+          name: Pushing Image to docker hub
+          command: |
+            echo $DOCKERHUB_PASSWORD | docker login -u $DOCKERHUB_USERNAME --password-stdin
+            docker push ${DOCKHUB_ORGANISATION}/binary-static-academy:${CIRCLE_SHA1}
+            docker push ${DOCKHUB_ORGANISATION}/binary-static-academy:latest
+  k8s_deploy:
+    description: "Deploy to k8s cluster"
+    parameters:
+      k8s_version:
+        type: string
+        default: ${CIRCLE_SHA1}
+      k8s_namespace:
+        type: string
+        default: "academy-binary-com-production"
+    steps:
+      - k8s/install-kubectl
+      - run:
+          name: Deploying to k8s cluster for service binary-academy
+          command: |
+            export NAMESPACE=<< parameters.k8s_namespace >>
+            git clone https://github.com/binary-com/devops-ci-scripts
+            cd devops-ci-scripts/k8s-build_tools
+            echo $CA_CRT | base64 --decode > ca.crt
+            ./release.sh binary-static-academy << parameters.k8s_version >>
+  notify_slack:
+    description: "Notify slack"
+    steps:
+      - slack/status:
+          include_project_field: false
+          failure_message: "Release failed for Academy with version *$(cat _site/version)*"
+          success_message: "Release succeeded for Academy with version *$(cat _site/version)*"
+          webhook: ${SLACK_WEBHOOK} 
+jobs:
+  build:
+    docker:
+      - image: circleci/ruby:2.6.5
+    steps:
+      - git_checkout_from_cache
+      - bundle_install
+      - build
+  release_staging:
+    docker:
+      - image: circleci/ruby:2.6.5
+    steps:
+      - git_checkout_from_cache
+      - bundle_install
+      - build
+      - deploy:
+          target_branch: "staging"
+      - notify_slack
+  release_production:
+    docker:
+      - image: circleci/ruby:2.6.5
+    steps:
+      - git_checkout_from_cache
+      - bundle_install
+      - build
+      - deploy:
+          target_branch: "production"
+      - notify_slack
+  release_aws_production:
+    docker:
+      - image: circleci/ruby:2.6.5
+    steps:
+      - git_checkout_from_cache
+      - bundle_install
+      - build
+      - docker_build_push
+      - k8s_deploy
+workflows:
+  build:
+    jobs:
+      - build:
+          filters:
+            branches:
+              ignore: /^master$/
+  release:
+    jobs:
+      - release_staging:
+          filters:
+            branches:
+              only: /^master$/
+      - release_production:
+          filters:
+            branches:
+              ignore: /.*/
+            tags:
+              only: /^production.*/
+      - release_aws_production:
+          filters:
+            branches:
+              ignore: /.*/
+            tags:
+              only: /^production.*/
+          context: binary-frontend-artifact-upload
